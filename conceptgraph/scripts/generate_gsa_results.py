@@ -20,6 +20,9 @@ import pickle
 import gzip
 import open_clip
 
+import glob
+import natsort
+
 import torch
 import torchvision
 from torch.utils.data import Dataset
@@ -52,8 +55,8 @@ sys.path.append(GSA_PATH) # This is needed for the following imports in this fil
 sys.path.append(TAG2TEXT_PATH) # This is needed for some imports in the Tag2Text files
 sys.path.append(EFFICIENTSAM_PATH)
 try:
-    from Tag2Text.models import tag2text
-    from Tag2Text import inference_tag2text, inference_ram
+    from ram.models import tag2text, ram
+    from ram import inference_tag2text, inference_ram
     import torchvision.transforms as TS
 except ImportError as e:
     print("Tag2text sub-package not found. Please check your GSA_PATH. ")
@@ -63,8 +66,11 @@ except ImportError as e:
 torch.set_grad_enabled(False)
     
 # GroundingDINO config and checkpoint
-GROUNDING_DINO_CONFIG_PATH = os.path.join(GSA_PATH, "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
-GROUNDING_DINO_CHECKPOINT_PATH = os.path.join(GSA_PATH, "./groundingdino_swint_ogc.pth")
+# GROUNDING_DINO_CONFIG_PATH = os.path.join(GSA_PATH, "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
+# GROUNDING_DINO_CHECKPOINT_PATH = os.path.join(GSA_PATH, "./groundingdino_swint_ogc.pth")
+
+GROUNDING_DINO_CONFIG_PATH="/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+GROUNDING_DINO_CHECKPOINT_PATH="/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/groundingdino_swint_ogc.pth", 
 
 # Segment-Anything checkpoint
 SAM_ENCODER_VERSION = "vit_h"
@@ -72,7 +78,7 @@ SAM_CHECKPOINT_PATH = os.path.join(GSA_PATH, "./sam_vit_h_4b8939.pth")
 
 # Tag2Text checkpoint
 TAG2TEXT_CHECKPOINT_PATH = os.path.join(TAG2TEXT_PATH, "./tag2text_swin_14m.pth")
-RAM_CHECKPOINT_PATH = os.path.join(TAG2TEXT_PATH, "./ram_swin_large_14m.pth")
+RAM_CHECKPOINT_PATH = "/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/ram_swin_large_14m.pth"
 
 FOREGROUND_GENERIC_CLASSES = [
     "item", "furniture", "object", "electronics", "wall decoration", "door"
@@ -126,6 +132,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exp_suffix", type=str, default=None,
                         help="The suffix of the folder that the results will be saved to. ")
     
+    parser.add_argument("--ovmm_trig", action="store_true")
     return parser
 
 
@@ -200,7 +207,7 @@ def get_sam_segmentation_from_xyxy(sam_predictor: SamPredictor, image: np.ndarra
     return np.array(result_masks)
 
 
-def get_sam_predictor(variant: str, device: str | int) -> SamPredictor:
+def get_sam_predictor(variant: str, device: str) -> SamPredictor:
     if variant == "sam":
         sam = sam_model_registry[SAM_ENCODER_VERSION](checkpoint=SAM_CHECKPOINT_PATH)
         sam.to(device)
@@ -285,7 +292,7 @@ def get_sam_segmentation_dense(
         raise NotImplementedError
 
 
-def get_sam_mask_generator(variant:str, device: str | int) -> SamAutomaticMaskGenerator:
+def get_sam_mask_generator(variant:str, device: str) -> SamAutomaticMaskGenerator:
     if variant == "sam":
         sam = sam_model_registry[SAM_ENCODER_VERSION](checkpoint=SAM_CHECKPOINT_PATH)
         sam.to(device)
@@ -352,10 +359,10 @@ def process_ai2thor_classes(classes: List[str], add_classes:List[str]=[], remove
 def main(args: argparse.Namespace):
     ### Initialize the Grounding DINO model ###
     grounding_dino_model = Model(
-        model_config_path=GROUNDING_DINO_CONFIG_PATH, 
-        model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH, 
-        device=args.device
-    )
+            model_config_path="/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+            model_checkpoint_path="/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/groundingdino_swint_ogc.pth", 
+            device=args.device
+        )
 
     ### Initialize the SAM model ###
     if args.class_set == "none":
@@ -422,7 +429,7 @@ def main(args: argparse.Namespace):
             # we reduce the threshold to obtain more tags
             tagging_model.threshold = 0.64 
         elif args.class_set == "ram":
-            tagging_model = tag2text.ram(pretrained=RAM_CHECKPOINT_PATH,
+            tagging_model = ram(pretrained=RAM_CHECKPOINT_PATH,
                                          image_size=384,
                                          vit='swin_l')
             
@@ -487,7 +494,7 @@ def main(args: argparse.Namespace):
             raw_image = tagging_transform(raw_image).unsqueeze(0).to(args.device)
             
             if args.class_set == "ram":
-                res = inference_ram.inference(raw_image , tagging_model)
+                res = inference_ram(raw_image , tagging_model)
                 caption="NA"
             elif args.class_set == "tag2text":
                 res = inference_tag2text.inference(raw_image , tagging_model, specified_tags)
@@ -630,9 +637,288 @@ def main(args: argparse.Namespace):
     if args.save_video:
         imageio.mimsave(video_save_path, frames, fps=10)
         print(f"Video saved to {video_save_path}")
+
+RESULT_PATH = "/home/nune/Home-robot/data_test/conc_data"
+COLOR_PATH = "/home/nune/Home-robot/code/concept_graphs/Datasets/OVMM/new_data/color"
+
+def read_data():
+    results_obs_path = glob.glob(os.path.join(RESULT_PATH, "*pkl.gz"))
+    results_obs_path = natsort.natsorted(results_obs_path)
+    for i in range(len(results_obs_path)):
+        with gzip.open(results_obs_path[i], "rb") as f:
+            obs_dict = pickle.load(f)      
+        # image = obs_dict['obs'].rgb
+        # camera_pose = obs_dict['obs'].camera_pose
+        # depth_image = obs_dict['obs'].depth
+        # robot_base_orientation = obs_dict['obs'].compass
+        # robot_base_gps = obs_dict['obs'].gps
+        # pick_object = obs_dict['obs'].task_observations["object_name"]
+        # start_recep = obs_dict['obs'].task_observations["start_recep_name"]
+        # end_recep = obs_dict['obs'].task_observations["place_recep_name"]
+        # third_person_image_rgb = obs_dict['obs'].third_person_image
+        yield obs_dict['obs']
+
+def main_ovmm(args):
+    print("------- OVMM ----------")
+    args.dataset_root = Path("/home/nune/Home-robot/code/concept_graphs/Datasets/OVMM")
+    args.dataset_id = Path("new_data")
+    args.class_set = "all_recep"
+    grounding_dino_model = Model(
+        model_config_path="/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+        model_checkpoint_path="/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/groundingdino_swint_ogc.pth", 
+        device=args.device
+    )
+    if args.class_set == "none":
+        mask_generator = get_sam_mask_generator(args.sam_variant, args.device)
+    else:
+        sam_predictor = get_sam_predictor(args.sam_variant, args.device)
+    
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+        "ViT-H-14", "laion2b_s32b_b79k"
+    )
+    clip_model = clip_model.to(args.device)
+    clip_tokenizer = open_clip.get_tokenizer("ViT-H-14")
+
+    dataset_ovmm = read_data()
+
+    global_classes = set()
+
+    if args.class_set == "all_recep":
+        classes = ['bathtub', 'bed', 'bench', 'cabinet', 'chair', 'chest_of_drawers', 'couch', 'counter', 'filing_cabinet',
+               'hamper', 'serving_cart', 'shelves', 'shoe_rack', 'sink', 'stand', 'stool', 'table', 'toilet', 'trunk',
+               'wardrobe', 'washer_dryer'
+            ]
+    elif args.class_set == "all_recep_and_obj":
+        classes = ['bathtub', 'bed', 'bench', 'cabinet', 'chair', 'chest_of_drawers', 'couch', 'counter', 'filing_cabinet',
+               'hamper', 'serving_cart', 'shelves', 'shoe_rack', 'sink', 'stand', 'stool', 'table', 'toilet', 'trunk',
+               'wardrobe', 'washer_dryer', "action_figure", "android_figure", "apple", "backpack", "baseballbat", "basket",
+                "basketball", "bath_towel", "battery_charger", "board_game", "book", "bottle", "bowl", "box", "bread",
+                "bundt_pan", "butter_dish", "c-clamp", "cake_pan", "can", "can_opener", "candle", "candle_holder",
+                "candy_bar", "canister", "carrying_case", "casserole", "cellphone", "clock", "cloth", "credit_card", 
+                "cup", "cushion", "dish", "doll", "dumbbell", "egg", "electric_kettle", "electronic_cable", "file_sorter",
+                "folder", "fork", "gaming_console", "glass", "hammer", "hand_towel", "handbag", "hard_drive", "hat", "helmet", 
+                "jar", "jug", "kettle", "keychain", "knife", "ladle", "lamp", "laptop", "laptop_cover", "laptop_stand", "lettuce", 
+                "lunch_box", "milk_frother_cup", "monitor_stand", "mouse_pad", "multiport_hub", "newspaper", "pan", "pen", 
+                "pencil_case", "phone_stand", "picture_frame", "pitcher", "plant_container", "plant_saucer", "plate", "plunger", 
+                "pot", "potato", "ramekin", "remote", "salt_and_pepper_shaker", "scissors", "screwdriver", "shoe", "soap", "soap_dish", 
+                "soap_dispenser", "spatula", "spectacles", "spicemill", "sponge", "spoon", "spray_bottle", "squeezer", "statue", 
+                "stuffed_toy", "sushi_mat", "tape", "teapot", "tennis_racquet", "tissue_box", "toiletry", "tomato", "toy_airplane", 
+                "toy_animal", "toy_bee", "toy_cactus", "toy_construction_set", "toy_fire_truck", "toy_food", "toy_fruits", "toy_lamp", 
+                "toy_pineapple", "toy_rattle", "toy_refrigerator", "toy_sink", "toy_sofa", "toy_swing", "toy_table", "toy_vehicle", "tray", 
+                "utensil_holder_cup", "vase", "video_game_cartridge", "watch", "watering_can", "wine_bottle",
+            ]
+    elif args.class_set == "ram":
+        tagging_model = ram(pretrained="/home/nune/Home-robot/code/home-robot/src/home_robot/home_robot/perception/detection/ram_gsam/Grounded_Segment_Anything/ram_swin_large_14m.pth",
+                                            image_size=384,
+                                            vit='swin_l')
+                
+        tagging_model = tagging_model.eval().to(args.device)
         
+        # initialize Tag2Text
+        tagging_transform = TS.Compose([
+            TS.Resize((384, 384)),
+            TS.ToTensor(), 
+            TS.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]),
+        ])
+        
+        classes = None
+    else:
+        raise ValueError("Unknown args.class_set: ", args.class_set)
+    
+    if args.class_set not in ["ram", "tag2text"]:
+        print("There are total", len(classes), "classes to detect. ")
+    elif args.class_set == "none":
+        print("Skipping tagging and detection models. ")
+    else:
+        print(f"{args.class_set} will be used to detect classes. ")
+    
+    save_name = f"{args.class_set}"
+    if args.sam_variant != "sam": # For backward compatibility
+        save_name += f"_{args.sam_variant}"
+    if args.exp_suffix:
+        save_name += f"_{args.exp_suffix}"
+    
+    if args.save_video:
+        video_save_path = args.dataset_root / args.scene_id / f"gsa_vis_{save_name}.mp4"
+        frames = []
+    step_ = 0
+
+    for idx, obs in enumerate(dataset_ovmm):
+        ### Relevant paths and load image ###
+        color_path = os.path.join(COLOR_PATH, "frame{:06d}".format(step_))
+
+        color_path = Path(color_path)
+        
+        vis_save_path = color_path.parent.parent / f"gsa_vis_{save_name}" / color_path.name
+        detections_save_path = color_path.parent.parent / f"gsa_detections_{save_name}" / color_path.name
+        detections_save_path = detections_save_path.with_suffix(".pkl.gz")
+        
+        os.makedirs(os.path.dirname(vis_save_path), exist_ok=True)
+        os.makedirs(os.path.dirname(detections_save_path), exist_ok=True)
+        
+        # opencv can't read Path objects... sigh...
+        color_path = str(color_path)
+        vis_save_path = str(vis_save_path)
+        detections_save_path = str(detections_save_path)
+        
+        image_rgb = obs.rgb 
+        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR) 
+        image_pil = Image.fromarray(image_rgb)
+
+        if args.class_set in ["ram", "tag2text"]:
+            raw_image = image_pil.resize((384, 384))
+            raw_image = tagging_transform(raw_image).unsqueeze(0).to(args.device)
+            
+            if args.class_set == "ram":
+                res = inference_ram(raw_image , tagging_model)
+                caption="NA"
+            elif args.class_set == "tag2text":
+                res = inference_tag2text.inference(raw_image , tagging_model, specified_tags)
+                caption=res[2]
+
+            # Currently ", " is better for detecting single tags
+            # while ". " is a little worse in some case
+            text_prompt=res[0].replace(' |', ',')
+            
+            # Add "other item" to capture objects not in the tag2text captions. 
+            # Remove "xxx room", otherwise it will simply include the entire image
+            # Also hide "wall" and "floor" for now...
+            add_classes = ["other item"]
+            remove_classes = [
+                "room", "kitchen", "office", "house", "home", "building", "corner",
+                "shadow", "carpet", "photo", "shade", "stall", "space", "aquarium", 
+                "apartment", "image", "city", "blue", "skylight", "hallway", 
+                "bureau", "modern", "salon", "doorway", "wall lamp"
+            ]
+            bg_classes = ["wall", "floor", "ceiling"]
+
+            if args.add_bg_classes:
+                add_classes += bg_classes
+            else:
+                remove_classes += bg_classes
+
+            classes = process_tag_classes(
+                text_prompt, 
+                add_classes = add_classes,
+                remove_classes = remove_classes,
+            )
+            print("classes : ", classes)
+        global_classes.update(classes)
+        if args.accumu_classes:
+            # Use all the classes that have been seen so far
+            classes = list(global_classes)
+            
+        ### Detection and segmentation ###
+        if args.class_set == "none":
+            # Directly use SAM in dense sampling mode to get segmentation
+            mask, xyxy, conf = get_sam_segmentation_dense(
+                args.sam_variant, mask_generator, image_rgb)
+            detections = sv.Detections(
+                xyxy=xyxy,
+                confidence=conf,
+                class_id=np.zeros_like(conf).astype(int),
+                mask=mask,
+            )
+            image_crops, image_feats, text_feats = compute_clip_features(
+                image_rgb, detections, clip_model, clip_preprocess, clip_tokenizer, classes, args.device)
+
+            ### Visualize results ###
+            annotated_image, labels = vis_result_fast(
+                image_bgr, detections, classes, instance_random_color=True)
+            
+            cv2.imwrite(vis_save_path, annotated_image)
+        else:
+            # Using GroundingDINO to detect and SAM to segment
+            detections = grounding_dino_model.predict_with_classes(
+                image=image_bgr, # This function expects a BGR image...
+                classes=classes,
+                box_threshold=args.box_threshold,
+                text_threshold=args.text_threshold,
+            )
+            
+            if len(detections.class_id) > 0:
+                ### Non-maximum suppression ###
+                # print(f"Before NMS: {len(detections.xyxy)} boxes")
+                nms_idx = torchvision.ops.nms(
+                    torch.from_numpy(detections.xyxy), 
+                    torch.from_numpy(detections.confidence), 
+                    args.nms_threshold
+                ).numpy().tolist()
+                # print(f"After NMS: {len(detections.xyxy)} boxes")
+
+                detections.xyxy = detections.xyxy[nms_idx]
+                detections.confidence = detections.confidence[nms_idx]
+                detections.class_id = detections.class_id[nms_idx]
+                
+                # Somehow some detections will have class_id=-1, remove them
+                valid_idx = detections.class_id != -1
+                detections.xyxy = detections.xyxy[valid_idx]
+                detections.confidence = detections.confidence[valid_idx]
+                detections.class_id = detections.class_id[valid_idx]
+                
+                ### Segment Anything ###
+                detections.mask = get_sam_segmentation_from_xyxy(
+                    sam_predictor=sam_predictor,
+                    image=image_rgb,
+                    xyxy=detections.xyxy
+                )
+
+                # Compute and save the clip features of detections  
+                image_crops, image_feats, text_feats = compute_clip_features(
+                    image_rgb, detections, clip_model, clip_preprocess, clip_tokenizer, classes, args.device)
+            else:
+                image_crops, image_feats, text_feats = [], [], []
+            
+            ### Visualize results ###
+            annotated_image, labels = vis_result_fast(image_bgr, detections, classes)
+            
+            # save the annotated grounded-sam image
+            if args.class_set in ["ram", "tag2text"] and args.use_slow_vis:
+                annotated_image_caption = vis_result_slow_caption(
+                    image_rgb, detections.mask, detections.xyxy, labels, caption, text_prompt)
+                Image.fromarray(annotated_image_caption).save(vis_save_path)
+            else:
+                cv2.imwrite(vis_save_path, annotated_image)
+        
+        if args.save_video:
+            frames.append(annotated_image)
+        
+        # Convert the detections to a dict. The elements are in np.array
+        results = {
+            "xyxy": detections.xyxy,
+            "confidence": detections.confidence,
+            "class_id": detections.class_id,
+            "mask": detections.mask,
+            "classes": classes,
+            "image_crops": image_crops,
+            "image_feats": image_feats,
+            "text_feats": text_feats,
+        }
+        
+        if args.class_set in ["ram", "tag2text"]:
+            results["tagging_caption"] = caption
+            results["tagging_text_prompt"] = text_prompt
+        
+        # save the detections using pickle
+        # Here we use gzip to compress the file, which could reduce the file size by 500x
+        with gzip.open(detections_save_path, "wb") as f:
+            pickle.dump(results, f)
+
+        step_ += 1
+
+    # save global classes
+    with open(args.dataset_root / args.scene_id / f"gsa_classes_{save_name}.json", "w") as f:
+        json.dump(list(global_classes), f)
+            
+    if args.save_video:
+        imageio.mimsave(video_save_path, frames, fps=10)
+        print(f"Video saved to {video_save_path}")
 
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
-    main(args)
+    if args.ovmm_trig:
+        main_ovmm(args)
+    else:
+        main(args)

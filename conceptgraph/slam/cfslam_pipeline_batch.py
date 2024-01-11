@@ -9,6 +9,9 @@ import os
 from pathlib import Path
 import gzip
 import pickle
+import glob 
+import natsort
+import trimesh.transformations as tra
 
 # Related third party imports
 from PIL import Image
@@ -40,6 +43,7 @@ from conceptgraph.slam.utils import (
     filter_objects,
     merge_objects, 
     gobs_to_detection_list,
+    gobs_to_detection_list_ovmm
 )
 from conceptgraph.slam.mapping import (
     compute_spatial_similarities,
@@ -432,6 +436,346 @@ def main(cfg : DictConfig):
         )
         imageio.mimwrite(video_save_path, frames, fps=10)
         print("Save video to %s" % video_save_path)
+
+RESULT_PATH = "/home/nune/Home-robot/data_test/conc_data"
+COLOR_PATH = "/home/nune/Home-robot/code/concept_graphs/Datasets/OVMM/new_data/color"
+
+def read_data():
+    results_obs_path = glob.glob(os.path.join(RESULT_PATH, "*pkl.gz"))
+    results_obs_path = natsort.natsorted(results_obs_path)
+    for i in range(len(results_obs_path)):
+        with gzip.open(results_obs_path[i], "rb") as f:
+            obs_dict = pickle.load(f)      
+        # image = obs_dict['obs'].rgb
+        # camera_pose = obs_dict['obs'].camera_pose
+        # depth_image = obs_dict['obs'].depth
+        # robot_base_orientation = obs_dict['obs'].compass
+        # robot_base_gps = obs_dict['obs'].gps
+        # pick_object = obs_dict['obs'].task_observations["object_name"]
+        # start_recep = obs_dict['obs'].task_observations["start_recep_name"]
+        # end_recep = obs_dict['obs'].task_observations["place_recep_name"]
+        # third_person_image_rgb = obs_dict['obs'].third_person_image
+        yield obs_dict['obs']
+
+def main_ovmm(cfg):
+    cfg = process_cfg(cfg)  
+    data = read_data()
+
+    cfg.dataset_root = Path("/home/nune/Home-robot/code/concept_graphs/Datasets/OVMM")
+    cfg.dataset_id = Path("new_data")
+    
+    classes, class_colors = create_or_load_colors(cfg, cfg.color_file_name)
+
+    objects = MapObjectList(device=cfg.device)
+    
+    if not cfg.skip_bg:
+        # Handle the background detection separately 
+        # Each class of them are fused into the map as a single object
+        bg_objects = {
+            c: None for c in BG_CLASSES
+        }
+    else:
+        bg_objects = None
         
+    # For visualization
+    if cfg.vis_render:
+        view_param = o3d.io.read_pinhole_camera_parameters(cfg.render_camera_path)
+            
+        obj_renderer = OnlineObjectRenderer(
+            view_param = view_param,
+            base_objects = None, 
+            gray_map = False,
+        )
+        frames = []
+        
+    if cfg.save_objects_all_frames:
+        save_all_folder = os.path.join(cfg.dataset_root, cfg.scene_id, "objects_all_frames", f"{cfg.gsa_variant}_{cfg.save_suffix}")
+        os.makedirs(save_all_folder, exist_ok=True)
+    
+    step_ = 0
+    for idx, obs in enumerate(data):
+        # get color image
+        color_path = os.path.join(COLOR_PATH, "frame{:06d}".format(step_))
+        color_path = Path(color_path)
+
+        image_rgb_ = obs.rgb 
+        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR) 
+        image_pil = Image.fromarray(image_rgb)
+
+        color_tensor = np.asarray(image_rgb_)
+        color_tensor = cv2.resize(color_tensor, (cfg.image_width, cfg.image_height), interpolation=cv2.INTER_LINEAR)
+        color_tensor = torch.from_numpy(color_tensor)
+        color_tensor.to(cfg.device).type(torch.float)
+        
+        max_depth = 3.5
+        depth_image = obs.depth
+        depth_tensor = np.asarray(depth_image)
+        depth_tensor = cv2.resize(depth_tensor, (cfg.image_width, cfg.image_height), interpolation=cv2.INTER_NEAREST)
+        depth_tensor = np.expand_dims(depth_tensor, -1)
+        depth_tensor[depth_tensor > max_depth] = 0
+        depth_tensor = torch.from_numpy(depth_tensor)
+        depth_tensor.to(cfg.device).type(torch.float)
+
+        # Camera parameters
+        height_downsample_ratio = float(cfg.image_height) / cfg.image_height
+        width_downsample_ratio = float(cfg.image_width) / cfg.image_width
+        fx = 625.35
+        fy = 625.35
+        cx = 239.5
+        cy = 319.5
+        cam_k = np.eye(3)
+        cam_k[0, 0] = fx
+        cam_k[1, 1] = fy
+        cam_k[0, 2] = cx
+        cam_k[1, 2] = cy
+        cam_k = torch.from_numpy(cam_k)
+        #cam_k = scale_intrinsics(cam_k, height_downsample_ratio, width_downsample_ratio)
+        intrinsics = torch.eye(4).to(cam_k)
+        intrinsics[:3, :3] = cam_k
+        intrinsics.to(cfg.device).type(torch.float)
+
+        color_np = color_tensor.cpu().numpy()
+        image_rgb = (color_np).astype(np.uint8)
+        depth_tensor = depth_tensor[..., 0]
+        depth_array = depth_tensor.cpu().numpy()
+        cam_K = intrinsics.cpu().numpy()[:3, :3]
+
+        # load grounded SAM detections
+        gobs = None # stands for grounded SAM observations
+  
+        color_path = Path(color_path)
+        detections_path = color_path.parent.parent / cfg.detection_folder_name / color_path.name
+        detections_path = detections_path.with_suffix(".pkl.gz")
+        color_path = str(color_path)
+        detections_path = str(detections_path)
+        
+        with gzip.open(detections_path, "rb") as f:
+            gobs = pickle.load(f)
+
+        # get pose, this is the untrasformed pose.
+        unt_pose = obs.camera_opse
+        unt_pose = unt_pose.cpu().numpy()
+        
+        # Don't apply any transformation otherwise
+        adjusted_pose = obs.camera_opse
+        camera_pose = obs.camera_pose
+
+        current_pose = [0, 0, 0]
+        current_pose[0] = obs.gps[0]
+        current_pose[1] = obs.gps[1]
+        camera_height = camera_pose[2, 3]
+
+        angles = list(tra.euler_from_matrix(camera_pose[:3, :3], "rzyx"))
+        tilt_rad = -angles[1]
+        current_pose[2] = angles[0]
+        
+        fg_detection_list, bg_detection_list = gobs_to_detection_list_ovmm(
+            cfg = cfg,
+            image = image_rgb,
+            depth_array = depth_array,
+            cam_K = cam_K,
+            idx = idx,
+            gobs = gobs,
+            current_pose = current_pose,
+            camera_height = camera_height,
+            tilt_rad = tilt_rad,
+            class_names = classes,
+            BG_CLASSES = BG_CLASSES,
+            color_path = color_path,
+        )
+        
+        if len(bg_detection_list) > 0:
+            for detected_object in bg_detection_list:
+                class_name = detected_object['class_name'][0]
+                if bg_objects[class_name] is None:
+                    bg_objects[class_name] = detected_object
+                else:
+                    matched_obj = bg_objects[class_name]
+                    matched_det = detected_object
+                    bg_objects[class_name] = merge_obj2_into_obj1(cfg, matched_obj, matched_det, run_dbscan=False)
+            
+        if len(fg_detection_list) == 0:
+            continue
+            
+        if cfg.use_contain_number:
+            xyxy = fg_detection_list.get_stacked_values_torch('xyxy', 0)
+            contain_numbers = compute_2d_box_contained_batch(xyxy, cfg.contain_area_thresh)
+            for i in range(len(fg_detection_list)):
+                fg_detection_list[i]['contain_number'] = [contain_numbers[i]]
+            
+        if len(objects) == 0:
+            # Add all detections to the map
+            for i in range(len(fg_detection_list)):
+                objects.append(fg_detection_list[i])
+
+            # Skip the similarity computation 
+            continue
+                
+        spatial_sim = compute_spatial_similarities(cfg, fg_detection_list, objects)
+        visual_sim = compute_visual_similarities(cfg, fg_detection_list, objects)
+        agg_sim = aggregate_similarities(cfg, spatial_sim, visual_sim)
+        
+        # Compute the contain numbers for each detection
+        if cfg.use_contain_number:
+            # Get the contain numbers for all objects
+            contain_numbers_objects = torch.Tensor([obj['contain_number'][0] for obj in objects])
+            detection_contained = contain_numbers > 0 # (M,)
+            object_contained = contain_numbers_objects > 0 # (N,)
+            detection_contained = detection_contained.unsqueeze(1) # (M, 1)
+            object_contained = object_contained.unsqueeze(0) # (1, N)                
+
+            # Get the non-matching entries, penalize their similarities
+            xor = detection_contained ^ object_contained
+            agg_sim[xor] = agg_sim[xor] - cfg.contain_mismatch_penalty
+        
+        # Threshold sims according to cfg. Set to negative infinity if below threshold
+        agg_sim[agg_sim < cfg.sim_threshold] = float('-inf')
+        
+        objects = merge_detections_to_objects(cfg, fg_detection_list, objects, agg_sim)
+        
+        # Perform post-processing periodically if told so
+        if cfg.denoise_interval > 0 and (idx+1) % cfg.denoise_interval == 0:
+            objects = denoise_objects(cfg, objects)
+        if cfg.filter_interval > 0 and (idx+1) % cfg.filter_interval == 0:
+            objects = filter_objects(cfg, objects)
+        if cfg.merge_interval > 0 and (idx+1) % cfg.merge_interval == 0:
+            objects = merge_objects(cfg, objects)
+            
+        if cfg.save_objects_all_frames:
+            save_all_path = os.path.join(save_all_folder, f"{idx:06d}.pkl.gz")
+            objects_to_save = MapObjectList([
+                _ for _ in objects if _['num_detections'] >= cfg.obj_min_detections
+            ])
+            
+            objects_to_save = prepare_objects_save_vis(objects_to_save)
+            
+            if not cfg.skip_bg:
+                bg_objects_to_save = MapObjectList([_ for _ in bg_objects.values() if _ is not None])
+                bg_objects_to_save = prepare_objects_save_vis(bg_objects_to_save)
+            else:
+                bg_objects_to_save = None
+            
+            result = {
+                "camera_pose": adjusted_pose,
+                "objects": objects_to_save,
+                "bg_objects": bg_objects_to_save,
+            }
+            with gzip.open(save_all_path, 'wb') as f:
+                pickle.dump(result, f)
+        
+        if cfg.vis_render:
+            objects_vis = MapObjectList([
+                copy.deepcopy(_) for _ in objects if _['num_detections'] >= cfg.obj_min_detections
+            ])
+            
+            if cfg.class_agnostic:
+                objects_vis.color_by_instance()
+            else:
+                objects_vis.color_by_most_common_classes(class_colors)
+            
+            rendered_image, vis = obj_renderer.step(
+                image = image_pil,
+                gt_pose = adjusted_pose,
+                new_objects = objects_vis,
+                paint_new_objects=False,
+                return_vis_handle = cfg.debug_render,
+            )
+
+            if cfg.debug_render:
+                vis.run()
+                del vis
+            
+            # Convert to uint8
+            if rendered_image is not None:
+                rendered_image = (rendered_image * 255).astype(np.uint8)
+                frames.append(rendered_image)
+            
+        step_ += 1
+        # print(
+        #     f"Finished image {idx} of {len(dataset)}", 
+        #     f"Now we have {len(objects)} objects.",
+        #     f"Effective objects {len([_ for _ in objects if _['num_detections'] >= cfg.obj_min_detections])}"
+        # )
+        
+    if bg_objects is not None:
+        bg_objects = MapObjectList([_ for _ in bg_objects.values() if _ is not None])
+        bg_objects = denoise_objects(cfg, bg_objects)
+        
+    objects = denoise_objects(cfg, objects)
+    
+    # Save the full point cloud before post-processing
+    if cfg.save_pcd:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        results = {
+            'objects': objects.to_serializable(),
+            'bg_objects': None if bg_objects is None else bg_objects.to_serializable(),
+            'cfg': cfg,
+            'class_names': classes,
+            'class_colors': class_colors,
+        }
+
+        pcd_save_path = os.path.join(cfg.dataset_root, cfg.scene_id, 'pcd_saves', f"full_pcd_{cfg.gsa_variant}_{cfg.save_suffix}.pkl.gz")
+        # make the directory if it doesn't exist
+        # pcd_save_path.parent.mkdir(parents=True, exist_ok=True)
+        # pcd_save_path = str(pcd_save_path)
+        
+        with gzip.open(pcd_save_path, "wb") as f:
+            pickle.dump(results, f)
+        print(f"Saved full point cloud to {pcd_save_path}")
+    
+    objects = filter_objects(cfg, objects)
+    objects = merge_objects(cfg, objects)
+    
+    # Save again the full point cloud after the post-processing
+    if cfg.save_pcd:
+        results['objects'] = objects.to_serializable()
+        pcd_save_path = pcd_save_path[:-7] + "_post.pkl.gz"
+        with gzip.open(pcd_save_path, "wb") as f:
+            pickle.dump(results, f)
+        print(f"Saved full point cloud after post-processing to {pcd_save_path}")
+        
+    if cfg.save_objects_all_frames:
+        save_meta_path = os.path.join(save_all_folder, f"meta.pkl.gz")
+        with gzip.open(save_meta_path, "wb") as f:
+            pickle.dump({
+                'cfg': cfg,
+                'class_names': classes,
+                'class_colors': class_colors,
+            }, f)
+        
+    if cfg.vis_render:
+        # Still render a frame after the post-processing
+        objects_vis = MapObjectList([
+            _ for _ in objects if _['num_detections'] >= cfg.obj_min_detections
+        ])
+
+        if cfg.class_agnostic:
+            objects_vis.color_by_instance()
+        else:
+            objects_vis.color_by_most_common_classes(class_colors)
+        
+        rendered_image, vis = obj_renderer.step(
+            image = image_pil,
+            gt_pose = adjusted_pose,
+            new_objects = objects_vis,
+            paint_new_objects=False,
+            return_vis_handle = False,
+        )
+        
+        # Convert to uint8
+        rendered_image = (rendered_image * 255).astype(np.uint8)
+        frames.append(rendered_image)
+        
+        # Save frames as a mp4 video
+        frames = np.stack(frames)
+        video_save_path = os.path.join(cfg.dataset_root, cfg.scene_id, ("objects_mapping-%s-%s.mp4" % (cfg.gsa_variant, cfg.save_suffix)))
+        imageio.mimwrite(video_save_path, frames, fps=10)
+        print("Save video to %s" % video_save_path)
+
 if __name__ == "__main__":
-    main()
+    ovmm_trig = True
+    if ovmm_trig:
+        main_ovmm()
+    else:
+        main()

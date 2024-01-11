@@ -58,6 +58,87 @@ def create_or_load_colors(cfg, filename="gsa_classes_tag2text"):
         print("Saved class colors to ", class_colors_fp)
     return classes, class_colors
 
+def normalize(v):
+    return v / np.linalg.norm(v)
+
+ANGLE_EPS = 0.001
+
+def get_r_matrix(ax_, angle):
+    ax = normalize(ax_)
+    if np.abs(angle) > ANGLE_EPS:
+        S_hat = np.array(
+            [[0.0, -ax[2], ax[1]], [ax[2], 0.0, -ax[0]], [-ax[1], ax[0], 0.0]],
+            dtype=np.float32,
+        )
+        R = (
+            np.eye(3)
+            + np.sin(angle) * S_hat
+            + (1 - np.cos(angle)) * (np.linalg.matrix_power(S_hat, 2))
+        )
+    else:
+        R = np.eye(3)
+    return R
+
+def create_object_pcd_ovmm(depth, mask, cam_K, image, current_pose, camera_height, tilt_rad, obj_color=None):
+    fx, fz, cx, cz = from_intrinsics_matrix(cam_K)
+    #print(" fx = {}, fz = {}, cx = {}, cz = {} ".format(fx, fz, cx, cz))
+    height, width = depth.shape
+
+    grid_x, grid_z = np.meshgrid(np.arange(width), np.arange(height))
+    
+    mask = np.logical_and(mask, depth > 0)
+    if mask.sum() == 0:
+        pcd = o3d.geometry.PointCloud()
+        return pcd
+
+    masked_depth = depth[mask]
+    #print("masked depth : ", masked_depth)
+    grid_x = grid_x[mask]
+    grid_z = grid_z[mask]
+
+    X_t = (grid_x - cx)*masked_depth/fx
+    Z_t = (grid_z - cz)*masked_depth/fz
+    Y_t = masked_depth
+
+    points = np.stack((X_t, Y_t, Z_t), axis=-1)
+    points = points.reshape(-1, 3)
+
+
+    if obj_color is None: # color using RGB
+        # # Apply mask to image
+        colors = image[mask] / 255.0
+    else: # color using group ID
+        # Use the assigned obj_color for all points
+        colors = np.full(points.shape, obj_color)
+
+    # Perturb the points a bit to avoid colinearity
+    points += np.random.normal(0, 4e-3, points.shape)
+    
+    # transforming pointcloud into geocentric frame to account for camera
+    # elevation and tilt angle
+    rot_1 = get_r_matrix([1.0, 0.0, 0.0], angle = tilt_rad)
+    points = np.matmul(points, rot_1.transpose(1, 0))
+    points[:, 2] += camera_height
+
+    # transforming pointcloud into geocentric frame to account for camera position
+    # and orientation
+    rot_2 = get_r_matrix([0.0, 0.0, 1.0], angle=current_pose[2])
+    points = np.matmul(points, rot_2.transpose(1, 0))
+    points[:, 0] += current_pose[0]
+    points[:, 1] += current_pose[1]
+
+
+    points[:, 2] *= -1
+
+    if points.shape[0] == 0:
+        import pdb; pdb.set_trace()
+    
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    
+    return pcd
+
 def create_object_pcd(depth_array, mask, cam_K, image, obj_color=None) -> o3d.geometry.PointCloud:
     fx, fy, cx, cy = from_intrinsics_matrix(cam_K)
     
@@ -258,8 +339,8 @@ def compute_overlap_matrix(cfg, objects: MapObjectList):
                 # # If any points are found within the threshold, increase overlap count
                 # overlap += sum([len(i) for i in I])
 
-                overlap = (D < cfg.downsample_voxel_size ** 2).sum() # D is the squared distance
-
+                #overlap = (D < cfg.downsample_voxel_size ** 2).sum() # D is the squared distance
+                overlap = (D < 0.006).sum() 
                 # Calculate the ratio of points within the threshold
                 overlap_matrix[i, j] = overlap / len(point_arrays[i])
 
@@ -343,9 +424,15 @@ def merge_overlap_objects(cfg, objects: MapObjectList, overlap_matrix: np.ndarra
             to_tensor(objects[j]['text_ft']),
             dim=0
         )
+        # if ratio > cfg.merge_overlap_thresh:
+        #     if visual_sim > cfg.merge_visual_sim_thresh and \
+        #         text_sim > cfg.merge_text_sim_thresh:
+        #         if kept_objects[j]:
+        #             # Then merge object i into object j
+        #             objects[j] = merge_obj2_into_obj1(cfg, objects[j], objects[i], run_dbscan=True)
+        #             kept_objects[i] = False
         if ratio > cfg.merge_overlap_thresh:
-            if visual_sim > cfg.merge_visual_sim_thresh and \
-                text_sim > cfg.merge_text_sim_thresh:
+            if visual_sim > cfg.merge_visual_sim_thresh:
                 if kept_objects[j]:
                     # Then merge object i into object j
                     objects[j] = merge_obj2_into_obj1(cfg, objects[j], objects[i], run_dbscan=True)
@@ -473,6 +560,103 @@ def resize_gobs(
         gobs['mask'] = np.asarray(new_mask)
         
     return gobs
+
+def gobs_to_detection_list_ovmm(
+    cfg, 
+    image, 
+    depth_array,
+    cam_K, 
+    idx, 
+    gobs, 
+    current_pose,
+    camera_height,
+    tilt_rad,
+    class_names = None,
+    BG_CLASSES = ["wall", "floor", "ceiling"],
+    color_path = None,
+):
+    '''
+    Return a DetectionList object from the gobs
+    All object are still in the camera frame. 
+    '''
+    fg_detection_list = DetectionList()
+    bg_detection_list = DetectionList()
+    
+    #gobs = resize_gobs(gobs, image)
+    gobs = filter_gobs(cfg, gobs, image, BG_CLASSES)
+    
+    if len(gobs['xyxy']) == 0:
+        return fg_detection_list, bg_detection_list
+    
+    # Compute the containing relationship among all detections and subtract fg from bg objects
+    xyxy = gobs['xyxy']
+    mask = gobs['mask']
+    gobs['mask'] = mask_subtract_contained(xyxy, mask)
+    
+    n_masks = len(gobs['xyxy'])
+    for mask_idx in range(n_masks):
+        local_class_id = gobs['class_id'][mask_idx]
+        mask = gobs['mask'][mask_idx]
+        class_name = gobs['classes'][local_class_id]
+
+        global_class_id = -1 if class_names is None else class_names.index(class_name)
+        
+        # make the pcd and color it
+        camera_object_pcd = create_object_pcd_ovmm(
+            depth_array,
+            mask,
+            cam_K,
+            image,
+            current_pose,
+            camera_height,
+            tilt_rad,
+            obj_color = None
+        )
+
+        if len(camera_object_pcd.points) < 5:  
+            continue
+
+
+        global_object_pcd = camera_object_pcd
+
+        global_object_pcd = process_pcd(global_object_pcd, cfg)
+        pcd_bbox = get_bounding_box(cfg, global_object_pcd)
+        pcd_bbox.color = [0,1,0]
+        
+        if pcd_bbox.volume() < 1e-6:
+            continue
+        
+        detected_object = {
+            'image_idx' : [idx],                             # idx of the image
+            'mask_idx' : [mask_idx],                         # idx of the mask/detection
+            'color_path' : [color_path],                     # path to the RGB image
+            'class_name' : [class_name],                         # global class id for this detection
+            'object_name' : ["unnamed"],
+            'class_id' : [global_class_id],                         # global class id for this detection
+            'num_detections' : 1,                            # number of detections in this object
+            'mask': [mask],
+            'xyxy': [gobs['xyxy'][mask_idx]],
+            'conf': [gobs['confidence'][mask_idx]],
+            'n_points': [len(global_object_pcd.points)],
+            'pixel_area': [mask.sum()],
+            'contain_number': [None],                          # This will be computed later
+            "inst_color": np.random.rand(3),                 # A random color used for this segment instance
+            'is_background': class_name in BG_CLASSES,
+            'clip_ft_all' : [gobs['image_feats'][mask_idx]],
+
+            # These are for the entire 3D object
+            'pcd': global_object_pcd,
+            'bbox': pcd_bbox,
+            'clip_ft': to_tensor(gobs['image_feats'][mask_idx]),
+            'text_ft': to_tensor(gobs['text_feats'][mask_idx]),
+        }
+        
+        if class_name in BG_CLASSES:
+            bg_detection_list.append(detected_object)
+        else:
+            fg_detection_list.append(detected_object)
+    
+    return fg_detection_list, bg_detection_list
 
 def gobs_to_detection_list(
     cfg, 
